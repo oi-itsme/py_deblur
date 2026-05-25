@@ -1,0 +1,22 @@
+{
+  "datasets_root": "datasets",
+  "output_root": "results",
+  "dataset_patterns": ["*", "*/*"],
+  "frame_subdir_candidates": ["frame", "frames"],
+  "event_file_candidates": ["event.mat"],
+  "default_search": {
+    "tau_ratios": [0.5, 1.0, 1.5],
+    "k_sizes": [13, 17, 21],
+    "alphas": [0.12, 0.16, 0.24],
+    "betas": [0.016, 0.032, 0.064],
+    "omegas": [0.01, 0.02, 0.03],
+    "outer_iters": [8, 10],
+    "sigma": 0.002,
+    "contrast_threshold": 1.0
+  },
+  "frame_selection": {
+    "mode": "explicit_or_auto",
+    "explicit_frame_indices": [10],
+    "auto_pick_count": 3
+  }
+}
