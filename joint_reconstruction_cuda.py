@@ -104,8 +104,8 @@ def joint_reconstruction_cuda(
     gamma = gamma_init
     history = []
 
-    logger.info("    联合重建开始: k_size=%s, outer_iters=%d, alpha=%.3f, beta=%.4f, omega=%.3f, device=%s",
-                k_size, outer_iters, alpha, beta, omega, device)
+    logger.debug("    联合重建开始: k_size=%s, outer_iters=%d, alpha=%.3f, beta=%.4f, omega=%.3f, device=%s",
+                 k_size, outer_iters, alpha, beta, omega, device)
 
     for it in range(outer_iters):
         if it > 0:

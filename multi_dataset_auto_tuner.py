@@ -34,6 +34,18 @@ from joint_reconstruction_cuda import joint_reconstruction_cuda
 logger = logging.getLogger(__name__)
 
 
+def _fmt(n):
+    """1234567 → '1.2M', 127932 → '128k', 0.0123 → '0.012'."""
+    if isinstance(n, float) and n < 1:
+        return f"{n:.3f}"
+    n = float(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(int(n))
+
+
 DEFAULT_CONFIG = {
     'datasets_root': 'datasets',
     'output_root': 'results',
@@ -216,14 +228,15 @@ def make_selected_combos(nominal_dt, search_cfg):
 
 
 def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_all, out_dir, search_cfg):
-    logger.info("  [frame %d] 开始处理，时间戳=%d", frame_idx, int(end_ts))
     t_start = time.time()
     blurry = load_frame(frame_path)
     baseline_metrics = grad_metrics(blurry)
+    baseline_score = score_metrics(baseline_metrics)
     nominal_dt = end_ts - prev_ts
     selected = make_selected_combos(nominal_dt, search_cfg)
-    logger.info("  [frame %d] 模糊基线评分=%.6f, Δt=%d, 参数组合数=%d",
-                frame_idx, score_metrics(baseline_metrics), int(nominal_dt), len(selected))
+
+    logger.info("  [f%d] ts=%s Δt=%s baseline=%s | %d combos",
+                frame_idx, _fmt(end_ts), _fmt(nominal_dt), _fmt(baseline_score), len(selected))
 
     frame_results = []
     frame_dir = os.path.join(out_dir, f'frame_{frame_idx:04d}')
@@ -231,10 +244,9 @@ def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_a
 
     for run_id, (tau, ks, alpha, beta, omega, outer_iters) in enumerate(selected, start=1):
         t_run = time.time()
-        logger.info("    [run %d/%d] tau=%d k=%d a=%.3f b=%.4f o=%.3f it=%d",
-                    run_id, len(selected), int(tau), ks, alpha, beta, omega, outer_iters)
         start_ts = end_ts - tau
         events = select_window(events_all, start_ts, end_ts)
+        tau_ratio = tau / nominal_dt if nominal_dt != 0 else 0
         out = joint_reconstruction_cuda(
             blurry_image=blurry,
             raw_events=events,
@@ -257,7 +269,7 @@ def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_a
             'frame_idx': frame_idx,
             'frame_path': frame_path,
             'tau': float(tau),
-            'tau_ratio': float(tau / nominal_dt) if nominal_dt != 0 else None,
+            'tau_ratio': float(tau_ratio),
             'k_size': ks,
             'alpha': alpha,
             'beta': beta,
@@ -270,10 +282,16 @@ def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_a
             'nominal_dt': float(nominal_dt),
         })
         elapsed = time.time() - t_run
-        logger.info("    [run %d/%d] 完成, score=%.6f, 事件数=%d, 耗时=%.1fs",
-                    run_id, len(selected), score, int(events.shape[0]), elapsed)
+        logger.info("    [%d/%d] τ=%s(%.1f) k=%d e=%s → %s  %.1fs",
+                    run_id, len(selected), _fmt(tau), tau_ratio, ks, _fmt(events.shape[0]), _fmt(score), elapsed)
 
     frame_results = sorted(frame_results, key=lambda x: x['score'], reverse=True)
+    best = frame_results[0]
+    delta_pct = (best['score'] / baseline_score - 1) * 100 if baseline_score > 0 else 0
+    sign = '↑' if delta_pct >= 0 else '↓'
+    logger.info("    ✔ τ=%s(%.1f) k=%d → %s %s%.0f%%  %.1fs",
+                _fmt(best['tau']), best['tau_ratio'], best['k_size'], _fmt(best['score']), sign, abs(delta_pct),
+                time.time() - t_start)
     topn = min(4, len(frame_results))
     fig, axes = plt.subplots(1, topn + 1, figsize=(4 * (topn + 1), 4.2))
     axes[0].imshow(blurry, cmap='gray', vmin=0, vmax=1)
@@ -296,9 +314,7 @@ def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_a
         for k, v in frame_results[0].items():
             f.write(f'{k}: {v}\n')
 
-    logger.info("  [frame %d] 最佳: tag=%s, score=%.6f, 总耗时=%.1fs",
-                frame_idx, frame_results[0]['tag'], frame_results[0]['score'], time.time() - t_start)
-    return frame_results[0], frame_results
+    return frame_results[0], frame_results, baseline_score
 
 
 def main():
@@ -322,20 +338,13 @@ def main():
     for ds_idx, ds in enumerate(datasets, start=1):
         dataset_root = ds['dataset_root']
         dataset_name = os.path.basename(os.path.normpath(dataset_root))
-        logger.info("=" * 60)
-        logger.info("[数据集 %d/%d] %s", ds_idx, len(datasets), dataset_name)
-        logger.info("=" * 60)
         t_ds = time.time()
         out_dir = os.path.join(cfg['output_root'], dataset_name)
         os.makedirs(out_dir, exist_ok=True)
 
-        logger.info("  加载事件文件: %s", ds['event_path'])
         events_all = load_events(ds['event_path'])
-        logger.info("  事件总数: %d", events_all.shape[0])
 
         frame_paths = sorted(glob.glob(os.path.join(ds['frame_dir'], '*.png')))
-        logger.info("  帧目录: %s, 帧文件数: %d", ds['frame_dir'], len(frame_paths))
-
         parsed_all = []
         for p in frame_paths:
             try:
@@ -343,7 +352,13 @@ def main():
             except Exception:
                 continue
         parsed_all.sort(key=lambda x: x[0])
-        logger.info("  总帧数: %d", len(parsed_all))
+
+        logger.info("===== %s (%d/%d) | %d frames | %s events =====",
+                    dataset_name, ds_idx, len(datasets), len(parsed_all), _fmt(events_all.shape[0]))
+
+        if not parsed_all:
+            logger.warning("  无有效帧，跳过")
+            continue
 
         dataset_report = {
             'dataset_name': dataset_name,
@@ -362,7 +377,7 @@ def main():
                 else:
                     logger.info("  [frame %d] 跳过（仅有单帧，无法计算 Δt）", frame_idx)
                     continue
-            best, all_results = run_one_frame(
+            best, all_results, baseline_score = run_one_frame(
                 dataset_name=dataset_name,
                 frame_idx=frame_idx,
                 end_ts=end_ts,
@@ -375,6 +390,7 @@ def main():
             dataset_report['frames'].append({
                 'frame_idx': frame_idx,
                 'best': best,
+                'baseline_score': baseline_score,
                 'num_candidates': len(all_results),
             })
             global_summary.append({
@@ -393,33 +409,50 @@ def main():
 
         with open(os.path.join(out_dir, 'dataset_summary.json'), 'w', encoding='utf-8') as f:
             json.dump(dataset_report, f, indent=2)
-        logger.info("[数据集 %d/%d] %s 完成, 耗时=%.1fs", ds_idx, len(datasets), dataset_name, time.time() - t_ds)
+
+        ds_elapsed = time.time() - t_ds
+        frames_done = len(dataset_report['frames'])
+        if frames_done:
+            ds_scores = [f['best']['score'] for f in dataset_report['frames']]
+            ds_bases = [f['baseline_score'] for f in dataset_report['frames']]
+            avg_improve = sum(s / b - 1 for s, b in zip(ds_scores, ds_bases)) / frames_done * 100
+            sign = '↑' if avg_improve >= 0 else '↓'
+            logger.info("%s ✓ %d/%d frames | %s | avg %s%.0f%%",
+                        dataset_name, frames_done, len(parsed_all),
+                        _fmt(ds_elapsed) + 's', sign, abs(avg_improve))
+        else:
+            logger.info("%s ✓ %d/%d frames | %s",
+                        dataset_name, frames_done, len(parsed_all), _fmt(ds_elapsed) + 's')
 
     with open(os.path.join(cfg['output_root'], 'global_summary.json'), 'w', encoding='utf-8') as f:
         json.dump(global_summary, f, indent=2)
 
     with open(os.path.join(cfg['output_root'], 'global_summary.md'), 'w', encoding='utf-8') as f:
         f.write('# 多数据集自动调参汇总\n\n')
+        f.write('| dataset | frame | score | τ_ratio | k | α | β | ω | it |\n')
+        f.write('|---------|-------|-------|---------|----|------|-------|------|----|\n')
         for item in global_summary:
             f.write(
-                f"- {item['dataset_name']} / frame {item['frame_idx']}: "
-                f"score={item['score']:.6f}, tau={item['tau']:.1f}, tau_ratio={item['tau_ratio']:.3f}, "
-                f"k={item['k_size']}, a={item['alpha']}, b={item['beta']}, o={item['omega']}, it={item['outer_iters']}\n"
+                f"| {item['dataset_name']} | {item['frame_idx']} | {item['score']:.4f} | "
+                f"{item['tau_ratio']:.2f} | {item['k_size']} | {item['alpha']} | "
+                f"{item['beta']} | {item['omega']} | {item['outer_iters']} |\n"
             )
 
-    logger.info("=" * 60)
-    logger.info("全部完成！处理了 %d 个数据集, 总耗时=%.1fs", len(datasets), time.time() - t_total)
+    # 按数据集汇总
+    from collections import defaultdict
+    ds_groups = defaultdict(list)
+    for item in global_summary:
+        ds_groups[item['dataset_name']].append(item)
+
+    logger.info("===== 全局汇总 | %d datasets | %d frames | %s =====",
+                len(ds_groups), len(global_summary), _fmt(time.time() - t_total) + 's')
+    for ds_name, items in ds_groups.items():
+        avg_score = sum(it['score'] for it in items) / len(items)
+        avg_tau = sum(it['tau_ratio'] for it in items) / len(items)
+        top_k = max(set(it['k_size'] for it in items), key=lambda k: sum(1 for it in items if it['k_size'] == k))
+        logger.info("  %-20s  frames=%2d  avg_score=%.3f  avg_τ=%.2f  best_k=%d",
+                    ds_name, len(items), avg_score, avg_tau, top_k)
     logger.info("结果保存在 %s/", os.path.abspath(cfg['output_root']))
-
-    # 打印汇总表
-    if global_summary:
-        logger.info("--- 全局汇总 ---")
-        for item in global_summary:
-            logger.info(
-                "  %s / frame %d: score=%.6f tau_ratio=%.3f k=%d a=%.3f b=%.4f o=%.3f it=%d",
-                item['dataset_name'], item['frame_idx'], item['score'], item['tau_ratio'],
-                item['k_size'], item['alpha'], item['beta'], item['omega'], item['outer_iters'],
-            )
 
 
 if __name__ == '__main__':
