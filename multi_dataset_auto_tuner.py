@@ -64,7 +64,9 @@ def load_config(path='dataset_config_example.json'):
         with open(path, 'r', encoding='utf-8') as f:
             user_cfg = json.load(f)
         cfg = DEFAULT_CONFIG.copy()
-        cfg.update(user_cfg)
+        for key in cfg:
+            if key in user_cfg and key not in ('default_search', 'frame_selection'):
+                cfg[key] = user_cfg[key]
         if 'default_search' in user_cfg:
             merged = DEFAULT_CONFIG['default_search'].copy()
             merged.update(user_cfg['default_search'])
@@ -81,6 +83,11 @@ def load_config(path='dataset_config_example.json'):
 def load_events(mat_path):
     mat = sio.loadmat(mat_path)
     events = np.asarray(mat['event']).astype(np.float32)
+    # 自动检测事件格式: [x,y,t,p] 还是 [t,x,y,p]
+    # 如果第 0 列的值范围远超图像尺寸（>10000），就是 [t,x,y,p] 格式
+    if events[:, 0].max() > 10000:
+        logger.info("    检测到事件格式 [t,x,y,p]，自动转换为 [x,y,t,p]")
+        events = events[:, [1, 2, 0, 3]]
     events[:, 3] = np.where(events[:, 3] > 0, 1.0, -1.0)
     return events
 
