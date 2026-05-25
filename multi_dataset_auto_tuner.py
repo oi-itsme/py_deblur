@@ -50,11 +50,6 @@ DEFAULT_CONFIG = {
         'sigma': 2e-3,
         'contrast_threshold': 1.0,
     },
-    'frame_selection': {
-        'mode': 'explicit_or_auto',
-        'explicit_frame_indices': [10],
-        'auto_pick_count': 3,
-    }
 }
 
 
@@ -65,16 +60,12 @@ def load_config(path='dataset_config_example.json'):
             user_cfg = json.load(f)
         cfg = DEFAULT_CONFIG.copy()
         for key in cfg:
-            if key in user_cfg and key not in ('default_search', 'frame_selection'):
+            if key in user_cfg and key != 'default_search':
                 cfg[key] = user_cfg[key]
         if 'default_search' in user_cfg:
             merged = DEFAULT_CONFIG['default_search'].copy()
             merged.update(user_cfg['default_search'])
             cfg['default_search'] = merged
-        if 'frame_selection' in user_cfg:
-            merged = DEFAULT_CONFIG['frame_selection'].copy()
-            merged.update(user_cfg['frame_selection'])
-            cfg['frame_selection'] = merged
         return cfg
     logger.info("未找到配置文件 %s，使用默认配置", path)
     return DEFAULT_CONFIG
@@ -158,35 +149,6 @@ def discover_datasets(cfg):
     for ds in dataset_roots:
         logger.info("  %s", os.path.basename(ds['dataset_root']))
     return dataset_roots
-
-
-def choose_frames(frame_paths, cfg):
-    parsed = []
-    for p in frame_paths:
-        try:
-            idx, ts = parse_frame_info(p)
-            parsed.append((idx, ts, p))
-        except Exception:
-            continue
-    parsed.sort(key=lambda x: x[0])
-    if not parsed:
-        return []
-
-    explicit = cfg['frame_selection'].get('explicit_frame_indices', [])
-    selected = []
-    index_map = {idx: (idx, ts, p) for idx, ts, p in parsed}
-    for idx in explicit:
-        if idx in index_map:
-            selected.append(index_map[idx])
-
-    if selected:
-        return selected
-
-    # 如果没有命中显式索引，就自动取头/中/尾附近的若干帧。
-    auto_pick_count = cfg['frame_selection'].get('auto_pick_count', 3)
-    positions = np.linspace(0, len(parsed) - 1, num=min(auto_pick_count, len(parsed)), dtype=int)
-    uniq = sorted(set(positions.tolist()))
-    return [parsed[i] for i in uniq]
 
 
 def get_prev_timestamp(parsed_frames, current_index):
@@ -381,8 +343,7 @@ def main():
             except Exception:
                 continue
         parsed_all.sort(key=lambda x: x[0])
-        selected_frames = choose_frames(frame_paths, cfg)
-        logger.info("  选中帧: %s", [f[0] for f in selected_frames])
+        logger.info("  总帧数: %d", len(parsed_all))
 
         dataset_report = {
             'dataset_name': dataset_name,
@@ -392,11 +353,15 @@ def main():
             'frames': [],
         }
 
-        for frame_idx, end_ts, frame_path in selected_frames:
+        for frame_idx, end_ts, frame_path in parsed_all:
             prev_ts = get_prev_timestamp(parsed_all, frame_idx)
             if prev_ts is None:
-                logger.info("  [frame %d] 跳过（无前一帧，无法计算 Δt）", frame_idx)
-                continue
+                # 第一帧：用下一帧的时间差作为 nominal_dt
+                if len(parsed_all) > 1:
+                    prev_ts = end_ts - (parsed_all[1][1] - parsed_all[0][1])
+                else:
+                    logger.info("  [frame %d] 跳过（仅有单帧，无法计算 Δt）", frame_idx)
+                    continue
             best, all_results = run_one_frame(
                 dataset_name=dataset_name,
                 frame_idx=frame_idx,

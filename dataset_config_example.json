@@ -13,10 +13,5 @@
     "outer_iters": [8, 10],
     "sigma": 0.002,
     "contrast_threshold": 1.0
-  },
-  "frame_selection": {
-    "mode": "explicit_or_auto",
-    "explicit_frame_indices": [10],
-    "auto_pick_count": 3
   }
 }

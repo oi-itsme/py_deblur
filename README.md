@@ -5,17 +5,26 @@
 ## 快速开始
 
 ```bash
-# 粗筛所有数据集
+# 对所有数据集的所有帧进行去模糊优化
 uv run multi_dataset_auto_tuner.py
 ```
+
+## 工作原理
+
+对数据集的**每一帧**独立运行联合去模糊，帧之间通过事件流时间窗口切片自然关联：
+
+- **图像 → 事件**：当前恢复的潜在清晰图像梯度用于筛选事件（`filter_events_by_latent_gradient`），滤除噪声
+- **事件 → 图像**：筛选后的事件累积为梯度先验，引导潜在图像和模糊核的频域更新
+
+每帧运行多轮迭代（`outer_iters`），整个事件流按帧时间窗口 `[t - tau, t]` 切分后完整参与双向迭代，不留死角。
 
 ## 目录结构
 
 ```
-datasets/<name>/event.mat          # 事件数据
+datasets/<name>/event.mat          # 事件数据（[x,y,t,p] 或 [t,x,y,p]）
 datasets/<name>/frame/*.png        # 模糊帧（命名: <idx>_<timestamp>.png）
 results/<name>/frame_XXXX/         # 每帧输出：结果图、best_params.txt、tuning_results.json
-results/global_summary.md          # 全局汇总
+results/global_summary.md          # 所有数据集所有帧的全局汇总
 dataset_config_example.json        # 调参配置文件
 ```
 
