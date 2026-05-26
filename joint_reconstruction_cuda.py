@@ -200,6 +200,7 @@ def joint_reconstruction_cuda(
         filtered_events = filter_events_by_latent_gradient(E, S, omega=omega)
         # Eq.26: 时空邻域补偿
         filtered_events = spatiotemporal_compensation(E, filtered_events, mu=mu, nu=nu)
+        E = filtered_events
 
         event_grad_h, event_grad_v = generate_event_gradient_prior(
             filtered_events, B.shape, contrast_threshold=contrast_threshold
