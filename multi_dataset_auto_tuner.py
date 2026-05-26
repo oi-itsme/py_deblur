@@ -225,6 +225,7 @@ def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_a
                 frame_idx, _fmt(end_ts), _fmt(nominal_dt), _fmt(baseline_score), len(selected))
 
     frame_results = []
+    filtered_cache = {}
     frame_dir = os.path.join(out_dir, f'frame_{frame_idx:04d}')
     os.makedirs(frame_dir, exist_ok=True)
 
@@ -246,9 +247,11 @@ def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_a
         )
         restored = out['restored'].detach().cpu().numpy()
         kernel = out['kernel'].detach().cpu().numpy()
+        tag = f'{dataset_name}_f{frame_idx:04d}_r{run_id:02d}_tau{int(tau)}_k{ks}_a{alpha}_b{beta}_o{omega}_it{outer_iters}'
+        filtered_np = out['filtered_events'].detach().cpu().numpy()
+        filtered_cache[tag] = filtered_np
         metrics = grad_metrics(restored)
         score = score_metrics(metrics)
-        tag = f'{dataset_name}_f{frame_idx:04d}_r{run_id:02d}_tau{int(tau)}_k{ks}_a{alpha}_b{beta}_o{omega}_it{outer_iters}'
         save_triplet(blurry, restored, kernel, os.path.join(frame_dir, tag + '.png'), title=tag)
         frame_results.append({
             'tag': tag,
@@ -273,6 +276,11 @@ def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_a
 
     frame_results = sorted(frame_results, key=lambda x: x['score'], reverse=True)
     best = frame_results[0]
+    best_filtered = filtered_cache[best['tag']]
+    best_path = os.path.join(frame_dir, 'best_filtered_events.npy')
+    np.save(best_path, best_filtered)
+    best['filtered_events_path'] = best_path
+    best['num_filtered_events'] = int(len(best_filtered))
     delta_pct = (best['score'] / baseline_score - 1) * 100 if baseline_score > 0 else 0
     sign = '↑' if delta_pct >= 0 else '↓'
     logger.info("    ✔ τ=%s(%.1f) k=%d → %s %s%.0f%%  %.1fs",
@@ -379,6 +387,21 @@ def main():
             frame_best_list.append(best)
             frame_baselines.append(baseline)
 
+        # 拼接各帧干净事件，输出全局干净事件流
+        clean_parts = []
+        for b in frame_best_list:
+            path = b.get('filtered_events_path', '')
+            if path and os.path.exists(path):
+                clean_parts.append(np.load(path))
+        if clean_parts:
+            clean_all = np.concatenate(clean_parts, axis=0)
+            clean_all = clean_all[clean_all[:, 2].argsort()]
+            clean_path = os.path.join(out_dir, 'clean_events.npy')
+            np.save(clean_path, clean_all)
+            logger.info("  全局干净事件: %s 条 → %s", _fmt(clean_all.shape[0]), clean_path)
+        else:
+            clean_path = None
+
         dataset_report['frames'] = [
             {
                 'frame_idx': b['frame_idx'],
@@ -387,6 +410,9 @@ def main():
             }
             for i, b in enumerate(frame_best_list)
         ]
+        if clean_path:
+            dataset_report['clean_events_path'] = clean_path
+            dataset_report['num_clean_events'] = int(clean_all.shape[0])
         avg_baseline = sum(frame_baselines) / len(frame_baselines) if frame_baselines else 0
         avg_score = sum(b['score'] for b in frame_best_list) / len(frame_best_list) if frame_best_list else 0
         global_summary.append({

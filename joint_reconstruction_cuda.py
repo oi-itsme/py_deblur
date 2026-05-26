@@ -174,6 +174,7 @@ def joint_reconstruction_cuda(
     E = torch.as_tensor(raw_events, dtype=torch.float32, device=device)
     if E.ndim != 2 or E.shape[1] != 4:
         raise ValueError('raw_events must have shape [N,4] = [x,y,t,p]')
+    E_raw = E
 
     H, W = B.shape
 
@@ -199,7 +200,7 @@ def joint_reconstruction_cuda(
         # Eq.25: 基于当前潜像梯度自适应阈值过滤事件
         filtered_events = filter_events_by_latent_gradient(E, S, omega=omega)
         # Eq.26: 时空邻域补偿
-        filtered_events = spatiotemporal_compensation(E, filtered_events, mu=mu, nu=nu)
+        filtered_events = spatiotemporal_compensation(E_raw, filtered_events, mu=mu, nu=nu)
         E = filtered_events
 
         event_grad_h, event_grad_v = generate_event_gradient_prior(
