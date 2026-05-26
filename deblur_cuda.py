@@ -131,7 +131,7 @@ def update_auxiliary_gradients(S, beta, gamma):
     return z_h, z_v
 
 
-def update_blur_kernel(F_gBh, F_gBv, S, k_size=(25, 25), sigma=2e-3, nonnegative=True, filters=None):
+def update_blur_kernel(F_gBh, F_gBv, S, filters, k_size=(25, 25), sigma=2e-3, nonnegative=True):
     """根据当前 S 和预计算的 B 梯度 FFT 估计模糊核。
 
     F_gBh, F_gBv: 模糊图像梯度的 FFT（预计算，不随迭代变化）
