@@ -337,26 +337,17 @@ def run_all_frames_global(dataset_name, parsed_frames, events_all, out_dir, sear
                 best['tau_ratio'], best['k_size'], best['alpha'], best['beta'], best['omega'],
                 best['avg_score'], sign, abs(delta_pct), time.time() - t_start)
 
-    # Save top comparison for each frame with best params
-    best_out = global_joint_reconstruction(
-        blurry_images=blurry_list,
-        frame_timestamps=timestamps,
-        raw_events=events_all,
-        tau_ratio=best['tau_ratio'],
-        k_size=(best['k_size'], best['k_size']),
-        outer_iters=best['outer_iters'],
-        alpha=best['alpha'],
-        beta=best['beta'],
-        sigma=search_cfg['sigma'],
-        omega=best['omega'],
-        contrast_threshold=search_cfg['contrast_threshold'],
-    )
-    for i, (S, k) in enumerate(zip(best_out['restored'], best_out['kernels'])):
-        restored_np = S.detach().cpu().numpy()
-        kernel_np = k.detach().cpu().numpy()
-        tag = f'{dataset_name}_f{frame_indices[i]:04d}_best'
-        save_triplet(blurry_list[i], restored_np, kernel_np,
-                    os.path.join(dataset_dir, tag + '.png'), title=tag)
+    # Copy best run's already-generated images as "_best" — 无需重新运行
+    import shutil
+    best_tag_prefix = (f'{dataset_name}_f{{idx:04d}}_r{best["run_id"]:02d}'
+                       f'_tr{best["tau_ratio"]}_k{best["k_size"]}'
+                       f'_a{best["alpha"]}_b{best["beta"]}'
+                       f'_o{best["omega"]}_it{best["outer_iters"]}')
+    for i, frame_idx in enumerate(frame_indices):
+        src = os.path.join(dataset_dir, best_tag_prefix.format(idx=frame_idx) + '.png')
+        dst = os.path.join(dataset_dir, f'{dataset_name}_f{frame_idx:04d}_best.png')
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
 
     with open(os.path.join(dataset_dir, 'global_tuning_results.json'), 'w', encoding='utf-8') as f:
         json.dump({

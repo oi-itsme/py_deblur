@@ -2,7 +2,7 @@
 去模糊核心模块（PyTorch / CUDA 版本）
 =====================================
 
-这个文件实现联合重建算法中“图像去模糊”部分的核心数值步骤。
+这个文件实现联合重建算法中"图像去模糊"部分的核心数值步骤。
 整体思路与论文保持一致：
 1. 在频域中更新潜在清晰图像 S；
 2. 使用 L0 梯度先验对应的辅助变量 z 进行硬阈值稀疏约束；
@@ -11,7 +11,7 @@
 
 为了尽量贴近论文与历史修正版，这里特别保留了两个关键点：
 - psf2otf_torch() 在 FFT 前做 MATLAB 风格的 circular shift；
-- 事件先验最终以“梯度项”方式进入频域求解，而不是直接把事件图像当作强度真值。
+- 事件先验最终以"梯度项"方式进入频域求解，而不是直接把事件图像当作强度真值。
 """
 
 import logging
@@ -44,44 +44,67 @@ def get_gradient_filters(device):
     return dx, dy
 
 
-def gradient_torch(img: torch.Tensor):
-    """在频域中计算图像梯度。"""
-    device = img.device
+def precompute_filters(shape, device):
+    """预计算梯度滤波器的频域表示，整个算法过程中不变。"""
     dx, dy = get_gradient_filters(device)
+    F_dx = psf2otf_torch(dx, shape)
+    F_dy = psf2otf_torch(dy, shape)
+    return {
+        'F_dx': F_dx,
+        'F_dy': F_dy,
+        'F_dx_abs2': torch.abs(F_dx) ** 2,
+        'F_dy_abs2': torch.abs(F_dy) ** 2,
+        'denom_base': torch.abs(F_dx) ** 2 + torch.abs(F_dy) ** 2,
+        'shape': shape,
+        'device': device,
+    }
+
+
+def gradient_torch(img: torch.Tensor, filters=None):
+    """在频域中计算图像梯度。filters 为 precompute_filters() 的结果。"""
+    if filters is not None:
+        F_dx = filters['F_dx']
+        F_dy = filters['F_dy']
+    else:
+        device = img.device
+        dx, dy = get_gradient_filters(device)
+        F_dx = psf2otf_torch(dx, img.shape)
+        F_dy = psf2otf_torch(dy, img.shape)
+
     F_img = torch.fft.fft2(img)
-    grad_h = torch.real(torch.fft.ifft2(F_img * psf2otf_torch(dx, img.shape)))
-    grad_v = torch.real(torch.fft.ifft2(F_img * psf2otf_torch(dy, img.shape)))
+    grad_h = torch.real(torch.fft.ifft2(F_img * F_dx))
+    grad_v = torch.real(torch.fft.ifft2(F_img * F_dy))
     return grad_h, grad_v
 
 
-def divergence_from_gradients(theta_h: torch.Tensor, theta_v: torch.Tensor):
+def divergence_from_gradients(theta_h: torch.Tensor, theta_v: torch.Tensor, filters=None):
     """把两个方向的梯度场转回散度项（频域形式）。"""
-    device = theta_h.device
-    dx, dy = get_gradient_filters(device)
-    F_dx = psf2otf_torch(dx, theta_h.shape)
-    F_dy = psf2otf_torch(dy, theta_h.shape)
+    if filters is not None:
+        F_dx = filters['F_dx']
+        F_dy = filters['F_dy']
+    else:
+        device = theta_h.device
+        dx, dy = get_gradient_filters(device)
+        F_dx = psf2otf_torch(dx, theta_h.shape)
+        F_dy = psf2otf_torch(dy, theta_h.shape)
+
     return torch.conj(F_dx) * torch.fft.fft2(theta_h) + torch.conj(F_dy) * torch.fft.fft2(theta_v)
 
 
-def update_latent_image(B, k, event_grad_h, event_grad_v, z_h, z_v, alpha, gamma, eps=1e-6):
-    """更新潜在清晰图像 S。"""
-    H, W = B.shape
-    device = B.device
-    dx, dy = get_gradient_filters(device)
+def update_latent_image(F_B, F_k, event_div, z_div, alpha, gamma, filters, eps=1e-6):
+    """更新潜在清晰图像 S。
 
-    F_B = torch.fft.fft2(B)
-    F_k = psf2otf_torch(k, (H, W))
-    F_dx = psf2otf_torch(dx, (H, W))
-    F_dy = psf2otf_torch(dy, (H, W))
-
+    F_B: 模糊图像的 FFT（预计算，不随迭代变化）
+    filters: precompute_filters() 的结果
+    """
     numerator = torch.conj(F_k) * F_B
-    if event_grad_h is not None and event_grad_v is not None:
-        numerator = numerator + alpha * divergence_from_gradients(event_grad_h, event_grad_v)
-    numerator = numerator + gamma * divergence_from_gradients(z_h, z_v)
+    if event_div is not None:
+        numerator = numerator + alpha * event_div
+    numerator = numerator + gamma * z_div
 
     denominator = (
         torch.abs(F_k) ** 2
-        + (alpha + gamma) * (torch.abs(F_dx) ** 2 + torch.abs(F_dy) ** 2)
+        + (alpha + gamma) * filters['denom_base']
         + eps
     )
 
@@ -89,25 +112,25 @@ def update_latent_image(B, k, event_grad_h, event_grad_v, z_h, z_v, alpha, gamma
     return latent
 
 
-def update_auxiliary_gradients(S, beta, gamma):
+def update_auxiliary_gradients(S, beta, gamma, filters=None):
     """更新 L0 梯度先验中的辅助变量。"""
-    grad_h, grad_v = gradient_torch(S)
+    grad_h, grad_v = gradient_torch(S, filters=filters)
     keep = (grad_h.pow(2) + grad_v.pow(2)) > (beta / max(gamma, 1e-8))
     z_h = torch.where(keep, grad_h, torch.zeros_like(grad_h))
     z_v = torch.where(keep, grad_v, torch.zeros_like(grad_v))
     return z_h, z_v
 
 
-def update_blur_kernel(B, S, k_size=(25, 25), sigma=2e-3, nonnegative=True):
-    """根据当前 B 和 S 估计模糊核。"""
-    H, W = B.shape
+def update_blur_kernel(F_gBh, F_gBv, S, k_size=(25, 25), sigma=2e-3, nonnegative=True, filters=None):
+    """根据当前 S 和预计算的 B 梯度 FFT 估计模糊核。
+
+    F_gBh, F_gBv: 模糊图像梯度的 FFT（预计算，不随迭代变化）
+    """
+    H, W = S.shape
     kh, kw = k_size
 
-    grad_B_h, grad_B_v = gradient_torch(B)
-    grad_S_h, grad_S_v = gradient_torch(S)
+    grad_S_h, grad_S_v = gradient_torch(S, filters=filters)
 
-    F_gBh = torch.fft.fft2(grad_B_h)
-    F_gBv = torch.fft.fft2(grad_B_v)
     F_gSh = torch.fft.fft2(grad_S_h)
     F_gSv = torch.fft.fft2(grad_S_v)
 
@@ -129,3 +152,12 @@ def update_blur_kernel(B, S, k_size=(25, 25), sigma=2e-3, nonnegative=True):
         kernel = torch.zeros_like(kernel)
         kernel[kh // 2, kw // 2] = 1.0
     return kernel
+
+
+def precompute_blurry_fft(B, filters):
+    """预计算模糊图像相关的 FFT，整个算法过程中不变。"""
+    F_B = torch.fft.fft2(B)
+    grad_B_h, grad_B_v = gradient_torch(B, filters=filters)
+    F_gBh = torch.fft.fft2(grad_B_h)
+    F_gBv = torch.fft.fft2(grad_B_v)
+    return {'F_B': F_B, 'F_gBh': F_gBh, 'F_gBv': F_gBv}
