@@ -45,10 +45,10 @@ def accumulate_events_to_image(events: torch.Tensor, shape, contrast_threshold=1
     return event_img
 
 
-def generate_event_gradient_prior(events: torch.Tensor, shape, contrast_threshold=1.0, filters=None):
+def generate_event_gradient_prior(events: torch.Tensor, shape, contrast_threshold=1.0):
     """先累积事件图，再取梯度，得到事件先验。"""
     event_img = accumulate_events_to_image(events, shape, contrast_threshold=contrast_threshold)
-    prior_h, prior_v = gradient_torch(event_img, filters=filters)
+    prior_h, prior_v = gradient_torch_spatial(event_img)
     return prior_h, prior_v
 
 
@@ -188,6 +188,9 @@ def joint_reconstruction_cuda(
 
     gamma = gamma_init
     history = []
+    # Initialize auxiliary variables for L0 gradient prior (used in first iteration's S update)
+    z_h = torch.zeros_like(S)
+    z_v = torch.zeros_like(S)
 
     logger.debug("    联合重建开始: k_size=%s, outer_iters=%d, alpha=%.3f, beta=%.4f, omega=%.3f, device=%s",
                  k_size, outer_iters, alpha, beta, omega, device)
@@ -199,32 +202,34 @@ def joint_reconstruction_cuda(
         filtered_events = spatiotemporal_compensation(E, filtered_events, mu=mu, nu=nu)
 
         event_grad_h, event_grad_v = generate_event_gradient_prior(
-            filtered_events, B.shape, contrast_threshold=contrast_threshold, filters=filters
+            filtered_events, B.shape, contrast_threshold=contrast_threshold
         )
-        z_h, z_v = update_auxiliary_gradients(S, beta=beta, gamma=gamma, filters=filters)
-
         event_div = divergence_from_gradients(event_grad_h, event_grad_v, filters=filters)
+        # z_div uses z from previous iteration (or zero init on first iteration)
         z_div = divergence_from_gradients(z_h, z_v, filters=filters)
 
         F_k = psf2otf_torch(k, (H, W))
 
         S = update_latent_image(blurry_fft['F_B'], F_k, event_div, z_div, alpha, gamma, filters)
         S = torch.clamp(S, 0.0, 1.0)
+        # Update z from NEW S (Algorithm 1: z after S) — will be used next iteration
+        z_h, z_v = update_auxiliary_gradients(S, beta=beta, gamma=gamma)
         k = update_blur_kernel(blurry_fft['F_gBh'], blurry_fft['F_gBv'], S,
                                k_size=k_size, sigma=sigma, filters=filters)
 
-        history.append(
-            {
-                'iter': it + 1,
-                'num_events': int(filtered_events.shape[0]),
-                'kernel_sum': float(k.sum().item()),
-                'image_min': float(S.min().item()),
-                'image_max': float(S.max().item()),
-            }
-        )
-        logger.debug("    迭代 %d/%d: events=%d kernel_sum=%.4f img_range=[%.3f, %.3f] gamma=%.1f",
-                     it + 1, outer_iters, int(filtered_events.shape[0]),
-                     float(k.sum().item()), float(S.min().item()), float(S.max().item()), gamma)
+        if logger.isEnabledFor(logging.DEBUG):
+            history.append(
+                {
+                    'iter': it + 1,
+                    'num_events': int(filtered_events.shape[0]),
+                    'kernel_sum': float(k.sum().item()),
+                    'image_min': float(S.min().item()),
+                    'image_max': float(S.max().item()),
+                }
+            )
+            logger.debug("    迭代 %d/%d: events=%d kernel_sum=%.4f img_range=[%.3f, %.3f] gamma=%.1f",
+                         it + 1, outer_iters, int(filtered_events.shape[0]),
+                         float(k.sum().item()), float(S.min().item()), float(S.max().item()), gamma)
         gamma = min(gamma * 2.0, gamma_max)
 
     return {

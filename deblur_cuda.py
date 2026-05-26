@@ -122,9 +122,9 @@ def update_latent_image(F_B, F_k, event_div, z_div, alpha, gamma, filters, eps=1
     return latent
 
 
-def update_auxiliary_gradients(S, beta, gamma, filters=None):
+def update_auxiliary_gradients(S, beta, gamma):
     """更新 L0 梯度先验中的辅助变量。"""
-    grad_h, grad_v = gradient_torch(S, filters=filters)
+    grad_h, grad_v = gradient_torch_spatial(S)
     keep = (grad_h.pow(2) + grad_v.pow(2)) > (beta / max(gamma, 1e-8))
     z_h = torch.where(keep, grad_h, torch.zeros_like(grad_h))
     z_v = torch.where(keep, grad_v, torch.zeros_like(grad_v))
@@ -139,10 +139,10 @@ def update_blur_kernel(F_gBh, F_gBv, S, k_size=(25, 25), sigma=2e-3, nonnegative
     H, W = S.shape
     kh, kw = k_size
 
-    grad_S_h, grad_S_v = gradient_torch(S, filters=filters)
-
-    F_gSh = torch.fft.fft2(grad_S_h)
-    F_gSv = torch.fft.fft2(grad_S_v)
+    # Compute gradients directly in frequency domain to skip 2 IFFT + 2 FFT
+    F_S = torch.fft.fft2(S)
+    F_gSh = F_S * filters['F_dx']
+    F_gSv = F_S * filters['F_dy']
 
     num = torch.conj(F_gSh) * F_gBh + torch.conj(F_gSv) * F_gBv
     den = torch.abs(F_gSh) ** 2 + torch.abs(F_gSv) ** 2 + sigma
@@ -151,7 +151,7 @@ def update_blur_kernel(F_gBh, F_gBv, S, k_size=(25, 25), sigma=2e-3, nonnegative
 
     cy, cx = H // 2, W // 2
     hy, hx = kh // 2, kw // 2
-    kernel = kernel_full[cy - hy: cy + hy + 1, cx - hx: cx + hx + 1].clone()
+    kernel = kernel_full[cy - hy: cy + hy + 1, cx - hx: cx + hx + 1]
 
     if nonnegative:
         kernel = torch.clamp(kernel, min=0.0)

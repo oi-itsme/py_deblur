@@ -86,6 +86,8 @@ def load_config(path='dataset_config_example.json'):
 def load_events(mat_path):
     mat = sio.loadmat(mat_path)
     events = np.asarray(mat['event']).astype(np.float32)
+    if events.shape[0] == 0:
+        return events
     # 自动检测事件格式: [x,y,t,p] 还是 [t,x,y,p]
     # 如果第 0 列的值范围远超图像尺寸（>10000），就是 [t,x,y,p] 格式
     if events[:, 0].max() > 10000:
@@ -101,7 +103,7 @@ def load_frame(path):
 
 def parse_frame_info(path):
     name = os.path.basename(path)
-    m = re.match(r'^(\d+)_(-?\d+)\.png$', name)
+    m = re.match(r'^(\d+)_(-?\d+(?:\.\d+)?)\.png$', name)
     if not m:
         raise ValueError(f'无法从文件名解析帧索引和时间戳: {name}')
     return int(m.group(1)), float(m.group(2))
@@ -196,14 +198,14 @@ def make_selected_combos(nominal_dt, search_cfg):
     # 为了控制计算量，这里采用“代表性子集”策略，而不是全量暴力组合。
     selected = []
     preferred = [
-        (tau_values[0], search_cfg['k_sizes'][0], search_cfg['alphas'][0], search_cfg['betas'][0], search_cfg['omegas'][1], search_cfg['outer_iters'][0]),
-        (tau_values[0], search_cfg['k_sizes'][1], search_cfg['alphas'][1], search_cfg['betas'][1], search_cfg['omegas'][1], search_cfg['outer_iters'][0]),
-        (tau_values[1], search_cfg['k_sizes'][0], search_cfg['alphas'][0], search_cfg['betas'][0], search_cfg['omegas'][0], search_cfg['outer_iters'][0]),
-        (tau_values[1], search_cfg['k_sizes'][1], search_cfg['alphas'][1], search_cfg['betas'][1], search_cfg['omegas'][1], search_cfg['outer_iters'][0]),
-        (tau_values[1], search_cfg['k_sizes'][-1], search_cfg['alphas'][-1], search_cfg['betas'][-1], search_cfg['omegas'][-1], search_cfg['outer_iters'][-1]),
-        (tau_values[2], search_cfg['k_sizes'][0], search_cfg['alphas'][0], search_cfg['betas'][0], search_cfg['omegas'][1], search_cfg['outer_iters'][0]),
-        (tau_values[2], search_cfg['k_sizes'][1], search_cfg['alphas'][1], search_cfg['betas'][1], search_cfg['omegas'][-1], search_cfg['outer_iters'][0]),
-        (tau_values[0], search_cfg['k_sizes'][-1], search_cfg['alphas'][-1], search_cfg['betas'][1], search_cfg['omegas'][-1], search_cfg['outer_iters'][-1]),
+        (tau_values[0], search_cfg['k_sizes'][min(0, len(search_cfg['k_sizes'])-1)], search_cfg['alphas'][min(0, len(search_cfg['alphas'])-1)], search_cfg['betas'][min(0, len(search_cfg['betas'])-1)], search_cfg['omegas'][min(1, len(search_cfg['omegas'])-1)], search_cfg['outer_iters'][min(0, len(search_cfg['outer_iters'])-1)]),
+        (tau_values[0], search_cfg['k_sizes'][min(1, len(search_cfg['k_sizes'])-1)], search_cfg['alphas'][min(1, len(search_cfg['alphas'])-1)], search_cfg['betas'][min(1, len(search_cfg['betas'])-1)], search_cfg['omegas'][min(1, len(search_cfg['omegas'])-1)], search_cfg['outer_iters'][min(0, len(search_cfg['outer_iters'])-1)]),
+        (tau_values[1], search_cfg['k_sizes'][min(0, len(search_cfg['k_sizes'])-1)], search_cfg['alphas'][min(0, len(search_cfg['alphas'])-1)], search_cfg['betas'][min(0, len(search_cfg['betas'])-1)], search_cfg['omegas'][min(0, len(search_cfg['omegas'])-1)], search_cfg['outer_iters'][min(0, len(search_cfg['outer_iters'])-1)]),
+        (tau_values[1], search_cfg['k_sizes'][min(1, len(search_cfg['k_sizes'])-1)], search_cfg['alphas'][min(1, len(search_cfg['alphas'])-1)], search_cfg['betas'][min(1, len(search_cfg['betas'])-1)], search_cfg['omegas'][min(1, len(search_cfg['omegas'])-1)], search_cfg['outer_iters'][min(0, len(search_cfg['outer_iters'])-1)]),
+        (tau_values[1], search_cfg['k_sizes'][len(search_cfg['k_sizes'])-1], search_cfg['alphas'][len(search_cfg['alphas'])-1], search_cfg['betas'][len(search_cfg['betas'])-1], search_cfg['omegas'][len(search_cfg['omegas'])-1], search_cfg['outer_iters'][len(search_cfg['outer_iters'])-1]),
+        (tau_values[2], search_cfg['k_sizes'][min(0, len(search_cfg['k_sizes'])-1)], search_cfg['alphas'][min(0, len(search_cfg['alphas'])-1)], search_cfg['betas'][min(0, len(search_cfg['betas'])-1)], search_cfg['omegas'][min(1, len(search_cfg['omegas'])-1)], search_cfg['outer_iters'][min(0, len(search_cfg['outer_iters'])-1)]),
+        (tau_values[2], search_cfg['k_sizes'][min(1, len(search_cfg['k_sizes'])-1)], search_cfg['alphas'][min(1, len(search_cfg['alphas'])-1)], search_cfg['betas'][min(1, len(search_cfg['betas'])-1)], search_cfg['omegas'][len(search_cfg['omegas'])-1], search_cfg['outer_iters'][min(0, len(search_cfg['outer_iters'])-1)]),
+        (tau_values[0], search_cfg['k_sizes'][len(search_cfg['k_sizes'])-1], search_cfg['alphas'][len(search_cfg['alphas'])-1], search_cfg['betas'][min(1, len(search_cfg['betas'])-1)], search_cfg['omegas'][len(search_cfg['omegas'])-1], search_cfg['outer_iters'][len(search_cfg['outer_iters'])-1]),
     ]
     for item in preferred:
         if item in combos:
