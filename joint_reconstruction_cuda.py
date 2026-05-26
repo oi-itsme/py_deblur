@@ -4,9 +4,11 @@
 """
 
 import logging
+import numpy as np
 import torch
 from deblur_cuda import (
     gradient_torch,
+    gradient_torch_spatial,
     precompute_filters,
     precompute_blurry_fft,
     psf2otf_torch,
@@ -47,17 +49,37 @@ def generate_event_gradient_prior(events: torch.Tensor, shape, contrast_threshol
     """先累积事件图，再取梯度，得到事件先验。"""
     event_img = accumulate_events_to_image(events, shape, contrast_threshold=contrast_threshold)
     prior_h, prior_v = gradient_torch(event_img, filters=filters)
-    return prior_h, prior_v, event_img
+    return prior_h, prior_v
 
 
-def filter_events_by_latent_gradient(events: torch.Tensor, S: torch.Tensor, omega=0.05, filters=None):
-    """根据当前恢复图像梯度，对事件进行筛选。"""
+def _compute_gradient_mode(grad_mag: torch.Tensor, bins: int = 100) -> float:
+    """计算梯度幅值直方图的众数 q（Eq.25）。
+
+    q 代表图像中"平坦背景"区域的典型梯度值，用于自适应区分
+    真实边缘（梯度远离 q）与噪声（梯度接近 q）。
+    """
+    max_val = grad_mag.max().item()
+    if max_val <= 0:
+        return 0.0
+    hist = torch.histc(grad_mag.flatten(), bins=bins, min=0, max=max_val)
+    bin_width = max_val / bins
+    q = (hist.argmax().float() + 0.5) * bin_width
+    return q.item()
+
+
+def filter_events_by_latent_gradient(events: torch.Tensor, S: torch.Tensor, omega=0.05):
+    """根据当前恢复图像梯度，对事件进行筛选（Eq.25）。
+
+    q = 梯度幅值众数（代表平坦背景）
+    保留 |∇S| ∉ (q-ω, q+ω) 的事件，即只保留边缘处的事件。
+    """
     if events.numel() == 0:
         return events
 
     H, W = S.shape
-    grad_h, grad_v = gradient_torch(S, filters=filters)
+    grad_h, grad_v = gradient_torch_spatial(S)
     grad_mag = torch.sqrt(grad_h.pow(2) + grad_v.pow(2))
+    q = _compute_gradient_mode(grad_mag)
 
     x = events[:, 0].long()
     y = events[:, 1].long()
@@ -66,185 +88,62 @@ def filter_events_by_latent_gradient(events: torch.Tensor, S: torch.Tensor, omeg
         return events[:0]
 
     sampled = grad_mag[y[valid], x[valid]]
-    keep_valid = sampled >= omega
+    # Eq.25: keep if gradient is outside the background interval
+    keep_valid = (sampled <= q - omega) | (sampled >= q + omega)
     valid_indices = torch.where(valid)[0]
     keep_indices = valid_indices[keep_valid]
     return events[keep_indices]
 
 
-def compute_global_gradient_activity(S_list, filters=None):
-    """用所有帧的潜像计算全局梯度活动图。
+def spatiotemporal_compensation(events: torch.Tensor, filtered_events: torch.Tensor,
+                                mu: int = 2, nu: float = 5000.0) -> torch.Tensor:
+    """时空邻域补偿（Eq.26）：对梯度筛选后的事件，搜索其时空邻居并一并保留。
 
-    逐像素取所有帧中梯度幅值的最大值，含义是：
-    只要某个像素在任意一帧中有强梯度，就认为是真实边缘位置。
+    对于每个被保留下来的事件 ė_i，在原始事件流 E 中寻找满足
+    空间距离 ≤ μ 且时间距离 ≤ ν 的邻居 e_n，将其也视为真实信号。
 
-    返回 (global_map, list_of_grad_pairs) 以便复用梯度计算结果。
+    实现：批量将事件传到 CPU，用 numpy 向量化窗口搜索，避免 per-event GPU sync。
     """
-    global_map = None
-    grad_pairs = []
-    for S in S_list:
-        grad_h, grad_v = gradient_torch(S, filters=filters)
-        grad_mag = torch.sqrt(grad_h.pow(2) + grad_v.pow(2))
-        grad_pairs.append((grad_h, grad_v))
-        if global_map is None:
-            global_map = grad_mag
-        else:
-            global_map = torch.maximum(global_map, grad_mag)
-    return global_map, grad_pairs
-
-
-def filter_events_by_global_gradient(events: torch.Tensor, global_grad_map: torch.Tensor, omega=0.05):
-    """使用预计算的全局梯度图对事件进行筛选。"""
+    if filtered_events.numel() == 0:
+        return filtered_events
     if events.numel() == 0:
         return events
 
-    H, W = global_grad_map.shape
-    x = events[:, 0].long()
-    y = events[:, 1].long()
-    valid = (x >= 0) & (x < W) & (y >= 0) & (y < H)
-    if valid.sum() == 0:
-        return events[:0]
+    # 一次性传到 CPU
+    events_np = events.cpu().numpy()
+    kept_np = filtered_events.cpu().numpy()
 
-    sampled = global_grad_map[y[valid], x[valid]]
-    keep_valid = sampled >= omega
-    valid_indices = torch.where(valid)[0]
-    keep_indices = valid_indices[keep_valid]
-    return events[keep_indices]
+    # 按时间排序
+    sort_idx = np.argsort(events_np[:, 2])
+    sorted_events = events_np[sort_idx]
+    sorted_t = np.ascontiguousarray(sorted_events[:, 2])
 
+    n = len(sorted_events)
+    compensated = set()
 
-def global_joint_reconstruction(
-    blurry_images,
-    frame_timestamps,
-    raw_events,
-    tau_ratio=1.0,
-    k_size=(25, 25),
-    outer_iters=8,
-    alpha=0.24,
-    beta=0.064,
-    sigma=2e-3,
-    omega=0.05,
-    gamma_init=2.0,
-    gamma_max=1e5,
-    contrast_threshold=1.0,
-    device=None,
-):
-    """全局联合重建：用所有帧降噪事件流，再用事件流降噪所有帧。
+    for i in range(len(kept_np)):
+        t_i = kept_np[i, 2]
+        x_i = kept_np[i, 0]
+        y_i = kept_np[i, 1]
 
-    与单帧版本的区别：
-    - 事件筛选使用所有帧梯度信息的 max（全局梯度活动图），而非仅看当前帧
-    - 外迭代在所有帧的层面进行，每轮先全局筛选事件，再逐帧更新潜像和模糊核
-    """
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        left = np.searchsorted(sorted_t, t_i - nu)
+        right = min(np.searchsorted(sorted_t, t_i + nu), n)
+        if right <= left:
+            continue
 
-    num_frames = len(blurry_images)
-    if num_frames == 0:
-        return {'restored': [], 'kernels': [], 'history': [], 'device': device}
+        window = sorted_events[left:right]
+        dx = np.abs(window[:, 0] - x_i)
+        dy = np.abs(window[:, 1] - y_i)
+        matches = np.where((dx <= mu) & (dy <= mu))[0]
+        for m in matches:
+            compensated.add(int(sort_idx[left + m]))
 
-    H, W = blurry_images[0].shape
+    if not compensated:
+        return filtered_events
 
-    B_list = []
-    for b in blurry_images:
-        B_t = torch.as_tensor(b, dtype=torch.float32, device=device)
-        if B_t.ndim != 2:
-            raise ValueError('blurry_image must be 2D grayscale')
-        B_list.append(normalize_image(B_t))
-
-    E = torch.as_tensor(raw_events, dtype=torch.float32, device=device)
-    if E.ndim != 2 or E.shape[1] != 4:
-        raise ValueError('raw_events must have shape [N,4] = [x,y,t,p]')
-
-    # ---- 预计算整个算法过程中不变的数据 ----
-    filters = precompute_filters((H, W), device)
-    blurry_fft_list = [precompute_blurry_fft(b, filters) for b in B_list]
-
-    S_list = [b.clone() for b in B_list]
-    kh, kw = k_size
-    k_list = []
-    for _ in range(num_frames):
-        k = torch.zeros((kh, kw), dtype=torch.float32, device=device)
-        k[kh // 2, kw // 2] = 1.0
-        k_list.append(k)
-
-    # 按帧间隔计算每帧的 tau
-    tau_list = []
-    for i in range(num_frames):
-        if i == 0:
-            dt = frame_timestamps[1] - frame_timestamps[0] if num_frames > 1 else 0
-        else:
-            dt = frame_timestamps[i] - frame_timestamps[i - 1]
-        tau_list.append(tau_ratio * dt)
-
-    gamma = gamma_init
-    history = []
-
-    logger.debug("    全局联合重建开始: frames=%d, k_size=%s, outer_iters=%d, alpha=%.3f, beta=%.4f, omega=%.3f, device=%s",
-                 num_frames, k_size, outer_iters, alpha, beta, omega, device)
-
-    for it in range(outer_iters):
-        # Phase 1: 用所有帧降噪事件流
-        # compute_global_gradient_activity 同时返回每帧梯度，供 Phase 2 复用
-        global_grad_map = None
-        s_grad_pairs = None
-        if it > 0:
-            global_grad_map, s_grad_pairs = compute_global_gradient_activity(S_list, filters=filters)
-
-        frame_event_grads = []
-        frame_num_events = []
-        for i in range(num_frames):
-            t_i = frame_timestamps[i]
-            tau_i = tau_list[i]
-            mask = (E[:, 2] >= t_i - tau_i) & (E[:, 2] <= t_i)
-            events_i = E[mask]
-
-            if global_grad_map is not None:
-                events_i = filter_events_by_global_gradient(events_i, global_grad_map, omega=omega)
-
-            event_grad_h, event_grad_v, _ = generate_event_gradient_prior(
-                events_i, (H, W), contrast_threshold=contrast_threshold, filters=filters
-            )
-            frame_event_grads.append((event_grad_h, event_grad_v))
-            frame_num_events.append(int(events_i.shape[0]))
-
-        # Phase 2: 用事件流降噪所有帧
-        for i in range(num_frames):
-            event_grad_h, event_grad_v = frame_event_grads[i]
-            bf = blurry_fft_list[i]
-
-            # 优先使用 Phase 1 中已计算的 S 梯度，避免重复做 gradient_torch
-            if s_grad_pairs is not None:
-                grad_h, grad_v = s_grad_pairs[i]
-                keep = (grad_h.pow(2) + grad_v.pow(2)) > (beta / max(gamma, 1e-8))
-                z_h = torch.where(keep, grad_h, torch.zeros_like(grad_h))
-                z_v = torch.where(keep, grad_v, torch.zeros_like(grad_v))
-            else:
-                z_h, z_v = update_auxiliary_gradients(S_list[i], beta=beta, gamma=gamma, filters=filters)
-
-            event_div = divergence_from_gradients(event_grad_h, event_grad_v, filters=filters)
-            z_div = divergence_from_gradients(z_h, z_v, filters=filters)
-
-            F_k = psf2otf_torch(k_list[i], (H, W))
-
-            S_list[i] = update_latent_image(bf['F_B'], F_k, event_div, z_div, alpha, gamma, filters)
-            S_list[i] = torch.clamp(S_list[i], 0.0, 1.0)
-            k_list[i] = update_blur_kernel(bf['F_gBh'], bf['F_gBv'], S_list[i],
-                                           k_size=k_size, sigma=sigma, filters=filters)
-
-        history.append({
-            'iter': it + 1,
-            'num_events': frame_num_events,
-            'gamma': float(gamma),
-        })
-        logger.debug("    迭代 %d/%d: events=%s gamma=%.1f",
-                     it + 1, outer_iters, frame_num_events, gamma)
-        gamma = min(gamma * 2.0, gamma_max)
-
-    return {
-        'restored': S_list,
-        'kernels': k_list,
-        'history': history,
-        'device': device,
-    }
+    comp_indices = torch.tensor(sorted(compensated), dtype=torch.long, device=events.device)
+    combined = torch.cat([filtered_events, events[comp_indices]], dim=0)
+    return torch.unique(combined, dim=0)
 
 
 def joint_reconstruction_cuda(
@@ -256,6 +155,8 @@ def joint_reconstruction_cuda(
     beta=0.064,
     sigma=2e-3,
     omega=0.05,
+    mu=2,
+    nu=5000.0,
     gamma_init=2.0,
     gamma_max=1e5,
     contrast_threshold=1.0,
@@ -285,7 +186,6 @@ def joint_reconstruction_cuda(
     k = torch.zeros((kh, kw), dtype=torch.float32, device=device)
     k[kh // 2, kw // 2] = 1.0
 
-    filtered_events = E
     gamma = gamma_init
     history = []
 
@@ -293,10 +193,12 @@ def joint_reconstruction_cuda(
                  k_size, outer_iters, alpha, beta, omega, device)
 
     for it in range(outer_iters):
-        if it > 0:
-            filtered_events = filter_events_by_latent_gradient(E, S, omega=omega, filters=filters)
+        # Eq.25: 基于当前潜像梯度自适应阈值过滤事件
+        filtered_events = filter_events_by_latent_gradient(E, S, omega=omega)
+        # Eq.26: 时空邻域补偿
+        filtered_events = spatiotemporal_compensation(E, filtered_events, mu=mu, nu=nu)
 
-        event_grad_h, event_grad_v, event_img = generate_event_gradient_prior(
+        event_grad_h, event_grad_v = generate_event_gradient_prior(
             filtered_events, B.shape, contrast_threshold=contrast_threshold, filters=filters
         )
         z_h, z_v = update_auxiliary_gradients(S, beta=beta, gamma=gamma, filters=filters)

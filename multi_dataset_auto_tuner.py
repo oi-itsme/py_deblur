@@ -20,7 +20,7 @@ import re
 import json
 import glob
 import logging
-import math
+import shutil
 import time
 from itertools import product
 
@@ -29,7 +29,7 @@ import scipy.io as sio
 from PIL import Image
 import matplotlib.pyplot as plt
 
-from joint_reconstruction_cuda import joint_reconstruction_cuda, global_joint_reconstruction
+from joint_reconstruction_cuda import joint_reconstruction_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -163,22 +163,6 @@ def discover_datasets(cfg):
     return dataset_roots
 
 
-def get_prev_timestamp(parsed_frames, current_index):
-    current_pos = None
-    for i, item in enumerate(parsed_frames):
-        if item[0] == current_index:
-            current_pos = i
-            break
-    if current_pos is None or current_pos == 0:
-        return None
-    return parsed_frames[current_pos - 1][1]
-
-
-def select_window(events, start_ts, end_ts):
-    mask = (events[:, 2] >= start_ts) & (events[:, 2] <= end_ts)
-    return events[mask]
-
-
 def save_triplet(blurred, restored, kernel, out_path, title=''):
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
     axes[0].imshow(blurred, cmap='gray', vmin=0, vmax=1)
@@ -227,144 +211,6 @@ def make_selected_combos(nominal_dt, search_cfg):
     return selected
 
 
-def make_selected_combos_global(search_cfg):
-    """为全局优化生成代表性参数组合（使用 tau_ratio 而非绝对 tau）。"""
-    combos = list(product(
-        search_cfg['tau_ratios'],
-        search_cfg['k_sizes'],
-        search_cfg['alphas'],
-        search_cfg['betas'],
-        search_cfg['omegas'],
-        search_cfg['outer_iters'],
-    ))
-
-    preferred = [
-        (search_cfg['tau_ratios'][0], search_cfg['k_sizes'][0], search_cfg['alphas'][0], search_cfg['betas'][0], search_cfg['omegas'][1], search_cfg['outer_iters'][0]),
-        (search_cfg['tau_ratios'][0], search_cfg['k_sizes'][1], search_cfg['alphas'][1], search_cfg['betas'][1], search_cfg['omegas'][1], search_cfg['outer_iters'][0]),
-        (search_cfg['tau_ratios'][1], search_cfg['k_sizes'][0], search_cfg['alphas'][0], search_cfg['betas'][0], search_cfg['omegas'][0], search_cfg['outer_iters'][0]),
-        (search_cfg['tau_ratios'][1], search_cfg['k_sizes'][1], search_cfg['alphas'][1], search_cfg['betas'][1], search_cfg['omegas'][1], search_cfg['outer_iters'][0]),
-        (search_cfg['tau_ratios'][1], search_cfg['k_sizes'][-1], search_cfg['alphas'][-1], search_cfg['betas'][-1], search_cfg['omegas'][-1], search_cfg['outer_iters'][-1]),
-        (search_cfg['tau_ratios'][2], search_cfg['k_sizes'][0], search_cfg['alphas'][0], search_cfg['betas'][0], search_cfg['omegas'][1], search_cfg['outer_iters'][0]),
-        (search_cfg['tau_ratios'][2], search_cfg['k_sizes'][1], search_cfg['alphas'][1], search_cfg['betas'][1], search_cfg['omegas'][-1], search_cfg['outer_iters'][0]),
-        (search_cfg['tau_ratios'][0], search_cfg['k_sizes'][-1], search_cfg['alphas'][-1], search_cfg['betas'][1], search_cfg['omegas'][-1], search_cfg['outer_iters'][-1]),
-    ]
-    selected = []
-    for item in preferred:
-        if item in combos:
-            selected.append(item)
-    return selected
-
-
-def run_all_frames_global(dataset_name, parsed_frames, events_all, out_dir, search_cfg):
-    """全局优化：用所有帧降噪事件流，再用事件流降噪所有帧。"""
-    t_start = time.time()
-
-    blurry_list = []
-    timestamps = []
-    frame_indices = []
-    for frame_idx, end_ts, frame_path in parsed_frames:
-        blurry_list.append(load_frame(frame_path))
-        timestamps.append(end_ts)
-        frame_indices.append(frame_idx)
-
-    baseline_scores = [score_metrics(grad_metrics(b)) for b in blurry_list]
-    num_frames = len(blurry_list)
-    logger.info("  [%s] %d frames | baseline avg=%.4f",
-                dataset_name, num_frames, sum(baseline_scores) / num_frames)
-
-    selected = make_selected_combos_global(search_cfg)
-    logger.info("  %d param combos to try", len(selected))
-
-    dataset_dir = os.path.join(out_dir, 'global_results')
-    os.makedirs(dataset_dir, exist_ok=True)
-
-    all_results = []
-
-    for run_id, (tau_ratio, ks, alpha, beta, omega, outer_iters) in enumerate(selected, start=1):
-        t_run = time.time()
-        out = global_joint_reconstruction(
-            blurry_images=blurry_list,
-            frame_timestamps=timestamps,
-            raw_events=events_all,
-            tau_ratio=tau_ratio,
-            k_size=(ks, ks),
-            outer_iters=outer_iters,
-            alpha=alpha,
-            beta=beta,
-            sigma=search_cfg['sigma'],
-            omega=omega,
-            contrast_threshold=search_cfg['contrast_threshold'],
-        )
-
-        restored_list = out['restored']
-        kernel_list = out['kernels']
-
-        frame_scores = []
-        for i, (S, k) in enumerate(zip(restored_list, kernel_list)):
-            restored_np = S.detach().cpu().numpy()
-            kernel_np = k.detach().cpu().numpy()
-            metrics = grad_metrics(restored_np)
-            score = score_metrics(metrics)
-            frame_scores.append(score)
-
-            tag = f'{dataset_name}_f{frame_indices[i]:04d}_r{run_id:02d}_tr{tau_ratio}_k{ks}_a{alpha}_b{beta}_o{omega}_it{outer_iters}'
-            save_triplet(blurry_list[i], restored_np, kernel_np,
-                        os.path.join(dataset_dir, tag + '.png'), title=tag)
-
-        avg_score = sum(frame_scores) / len(frame_scores)
-        elapsed = time.time() - t_run
-        logger.info("    [%d/%d] τr=%.1f k=%d α=%.3f β=%.4f ω=%.3f → avg=%.4f  %.1fs",
-                    run_id, len(selected), tau_ratio, ks, alpha, beta, omega, avg_score, elapsed)
-
-        all_results.append({
-            'run_id': run_id,
-            'tau_ratio': tau_ratio,
-            'k_size': ks,
-            'alpha': alpha,
-            'beta': beta,
-            'omega': omega,
-            'outer_iters': outer_iters,
-            'frame_scores': frame_scores,
-            'avg_score': avg_score,
-            'device': out['device'],
-        })
-
-    all_results = sorted(all_results, key=lambda x: x['avg_score'], reverse=True)
-    best = all_results[0]
-    delta_pct = (best['avg_score'] / (sum(baseline_scores) / num_frames) - 1) * 100
-    sign = '↑' if delta_pct >= 0 else '↓'
-    logger.info("    ✔ best: τr=%.1f k=%d α=%.3f β=%.4f ω=%.3f → avg=%.4f %s%.0f%%  %.1fs",
-                best['tau_ratio'], best['k_size'], best['alpha'], best['beta'], best['omega'],
-                best['avg_score'], sign, abs(delta_pct), time.time() - t_start)
-
-    # Copy best run's already-generated images as "_best" — 无需重新运行
-    import shutil
-    best_tag_prefix = (f'{dataset_name}_f{{idx:04d}}_r{best["run_id"]:02d}'
-                       f'_tr{best["tau_ratio"]}_k{best["k_size"]}'
-                       f'_a{best["alpha"]}_b{best["beta"]}'
-                       f'_o{best["omega"]}_it{best["outer_iters"]}')
-    for i, frame_idx in enumerate(frame_indices):
-        src = os.path.join(dataset_dir, best_tag_prefix.format(idx=frame_idx) + '.png')
-        dst = os.path.join(dataset_dir, f'{dataset_name}_f{frame_idx:04d}_best.png')
-        if os.path.exists(src):
-            shutil.copy2(src, dst)
-
-    with open(os.path.join(dataset_dir, 'global_tuning_results.json'), 'w', encoding='utf-8') as f:
-        json.dump({
-            'baseline_scores': baseline_scores,
-            'avg_baseline': sum(baseline_scores) / num_frames,
-            'results': all_results,
-            'best': best,
-        }, f, indent=2)
-
-    with open(os.path.join(dataset_dir, 'best_params.txt'), 'w', encoding='utf-8') as f:
-        f.write(f'Best for {dataset_name} (global optimization)\n')
-        for k, v in best.items():
-            f.write(f'{k}: {v}\n')
-
-    return best, all_results, baseline_scores
-
-
 def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_all, out_dir, search_cfg):
     t_start = time.time()
     blurry = load_frame(frame_path)
@@ -383,7 +229,7 @@ def run_one_frame(dataset_name, frame_idx, end_ts, prev_ts, frame_path, events_a
     for run_id, (tau, ks, alpha, beta, omega, outer_iters) in enumerate(selected, start=1):
         t_run = time.time()
         start_ts = end_ts - tau
-        events = select_window(events_all, start_ts, end_ts)
+        events = events_all[(events_all[:, 2] >= start_ts) & (events_all[:, 2] <= end_ts)]
         tau_ratio = tau / nominal_dt if nominal_dt != 0 else 0
         out = joint_reconstruction_cuda(
             blurry_image=blurry,
@@ -510,32 +356,48 @@ def main():
             logger.warning("  无有效帧，跳过")
             continue
 
-        best, all_results, baseline_scores = run_all_frames_global(
-            dataset_name=dataset_name,
-            parsed_frames=parsed_all,
-            events_all=events_all,
-            out_dir=out_dir,
-            search_cfg=cfg['default_search'],
-        )
+        # 逐帧独立处理（论文 Algorithm 1 的设计）
+        frame_best_list = []
+        frame_baselines = []
+        events_min_ts = float(events_all[:, 2].min())
+
+        for i, (frame_idx, end_ts, frame_path) in enumerate(parsed_all):
+            # 首帧用事件流最早时间戳作为 prev_ts 兜底
+            prev_ts = parsed_all[i - 1][1] if i > 0 else events_min_ts
+            best, _, baseline = run_one_frame(
+                dataset_name=dataset_name,
+                frame_idx=frame_idx,
+                end_ts=end_ts,
+                prev_ts=prev_ts,
+                frame_path=frame_path,
+                events_all=events_all,
+                out_dir=out_dir,
+                search_cfg=cfg['default_search'],
+            )
+            frame_best_list.append(best)
+            frame_baselines.append(baseline)
+
         dataset_report['frames'] = [
             {
-                'frame_idx': frame_idx,
-                'baseline_score': baseline_scores[i],
-                'best_score': best['frame_scores'][i],
+                'frame_idx': b['frame_idx'],
+                'baseline_score': frame_baselines[i],
+                'best_score': b['score'],
             }
-            for i, (frame_idx, _, _) in enumerate(parsed_all)
+            for i, b in enumerate(frame_best_list)
         ]
+        avg_baseline = sum(frame_baselines) / len(frame_baselines) if frame_baselines else 0
+        avg_score = sum(b['score'] for b in frame_best_list) / len(frame_best_list) if frame_best_list else 0
         global_summary.append({
             'dataset_name': dataset_name,
             'num_frames': len(parsed_all),
-            'avg_baseline': sum(baseline_scores) / len(baseline_scores),
-            'avg_score': best['avg_score'],
-            'tau_ratio': best['tau_ratio'],
-            'k_size': best['k_size'],
-            'alpha': best['alpha'],
-            'beta': best['beta'],
-            'omega': best['omega'],
-            'outer_iters': best['outer_iters'],
+            'avg_baseline': avg_baseline,
+            'avg_score': avg_score,
+            'tau_ratio': frame_best_list[0]['tau_ratio'] if frame_best_list else 0,
+            'k_size': frame_best_list[0]['k_size'] if frame_best_list else 0,
+            'alpha': frame_best_list[0]['alpha'] if frame_best_list else 0,
+            'beta': frame_best_list[0]['beta'] if frame_best_list else 0,
+            'omega': frame_best_list[0]['omega'] if frame_best_list else 0,
+            'outer_iters': frame_best_list[0]['outer_iters'] if frame_best_list else 0,
         })
 
         with open(os.path.join(out_dir, 'dataset_summary.json'), 'w', encoding='utf-8') as f:
